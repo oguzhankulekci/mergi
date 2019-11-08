@@ -33,6 +33,7 @@
 #define MYDEBUGx
 #define BLCDx
 
+
 using namespace sdsl;
 using namespace std;
 
@@ -65,7 +66,7 @@ lcp_dac<> lcp;
 
 unsigned char* finalBWT;
 char *buffer;
-unsigned int  MAXCACHEITEMS;
+unsigned int  cacheSize,MAXCACHESIZE;
 pthread_t* threads;
 unsigned char complement[256];
 
@@ -117,84 +118,12 @@ void  insertSymbol(unsigned char symbol, unsigned long long position, unsigned c
     if ('\0'==symbol) T[position] = '$';
 }
 
-void* doWork(void* tparam){
-    
-    unsigned long long startPosition = ((threadParameterType*)tparam)->begin;
-    unsigned long long endPosition = ((threadParameterType*)tparam)->end;
-    
-    cacheItemType* cache = new cacheItemType[MAXCACHEITEMS+1];
-    //fm_index = cst->csa;
-    
-    unsigned char symbol;
-    unsigned long long p=0,C=0,rankReverse=0,L=0,R = fm_index.size()-1,dollarSignPos = fm_index.isa[0],saValue;
-    
-    unsigned long long visitedSymbols = 0;
-    
-    for(unsigned long long s= startPosition;s>endPosition;s--){
-        
-        //printProgress((double)(startPosition-s) / (double)(startPosition-endPosition) );
-        
-        visitedSymbols = 0;
-        saValue = fm_index[s];
-        
-        while((long)L<=(long)R){
-            
-            if (p<=MAXCACHEITEMS){ //save current range and rank
-                cache[p].left=L;
-                cache[p].right=R;
-                cache[p].count=rankReverse;
-            }
-            
-            symbol = buffer[saValue+p];
-            if (symbol=='\0'){
-                if ((L<=dollarSignPos) && (R>=dollarSignPos)){
-                    rankReverse++; // this suffix on forward strand is also a suffix on the reverse complement strand. As end of sequence is smaller than the forward-reverse splitter, add 1 to the rank
-                }
-                break;
-            }else {
-                C = visit(&L,&R,symbol,&fm_index,dollarSignPos);
-                rankReverse += C;
-                visitedSymbols++;
-            }
-            p++;
-        }// while
-#ifdef MYDEBUG
-        cout << s << ' ' << rankReverse << ' ' << rankReverse+s << ' ' << fm_index.bwt[s] << ' ' << visitedSymbols << ' ' << lcp[s] << endl;
-#endif
-        insertSymbol(fm_index.bwt[s],rankReverse + s,finalBWT);
-        //if (visitedSymbols>10000)
-        //cout << s << ' ' << fm_index[s] << ' ' << visitedSymbols << ' ' << lcp[s] << endl;
-        
-        if ( p <= lcp[s]){
-            
-            do{ //no need to look for the previous suffixes while their lcp values are greater then p since their initial strings of length p+1 are always unique
-                s--;
-                saValue = fm_index[s];
-                insertSymbol(buffer[saValue-1],rankReverse + s,finalBWT); //fm_index.bwt[s]
-                //visitedSymbols = 0;
-                //cout << s << ' ' << visitedSymbols << ' ' << cst.lcp[s] << endl;
-            }while ((p<=lcp[s]) && (s>endPosition));
-        }
-        
-        p = lcp[s]; // guaranteed that p>cst.lcp[s]
-        if (p>MAXCACHEITEMS) p = MAXCACHEITEMS;
-        
-        L = cache[p].left;
-        R = cache[p].right;
-        rankReverse = cache[p].count;
-    }
-    cout << visitedSymbols << endl;
-    ((threadParameterType*)tparam)->visitedSymbolCount = visitedSymbols;
-    return tparam;
-}
-
-
 void* doWorkEfficient(void* tparam){
     
     unsigned long long startPosition = ((threadParameterType*)tparam)->begin;
     unsigned long long endPosition   = ((threadParameterType*)tparam)->end;
     
-    cacheItemType* cache = new cacheItemType[MAXCACHEITEMS+1];
+    cacheItemType* cache = new cacheItemType[cacheSize+1];
     
     unsigned char symbol;
     unsigned long long offset=0, C=0, rankReverse=0, L=0, R = fm_index.size()-1, dollarSignPos = fm_index.isa[0],saValue;
@@ -235,17 +164,16 @@ void* doWorkEfficient(void* tparam){
                     }
                     stop = true; // no deed to go further after observing the smallest symbol, notice no need to update the cache since we didnot perform and lexCount or backwards search
                     
-                }else {
+                }else{
                     C = visit(&L,&R,symbol,&fm_index,dollarSignPos); // count smaller suffixes on reverse complement
                     rankReverse += C; // accumulate this to the rankReverse
-                    offset++; //increase the offset
-                    //if (offset<MAXCACHEITEMS){ // if we have enough cache size reserved
+                    if (offset<cacheSize){ // if we have enough cache size reserved
+                        offset++; //increase the offset
                         cache[offset].left  = L; //save the values in the cache for future use
                         cache[offset].right = R;
                         cache[offset].count = rankReverse;
-                    //}
+                    }
                 }
-                
             }else{// means L==R, then perform light scanning
                 unsigned char * LeftToRightPtr = (unsigned char*) &buffer[saValue+offset];
                 unsigned char * RightToLeftPtr = (unsigned char*) &buffer[fm_index[L]-1];
@@ -277,10 +205,11 @@ void* doWorkEfficient(void* tparam){
         }// while
         
         insertSymbol(fm_index.bwt[s],rankReverse + s,finalBWT);
+        
         if (offset>lcp[s]){
             offset = lcp[s];
         }
-        if (offset>MAXCACHEITEMS) offset = MAXCACHEITEMS;
+        
 #ifdef MYDEBUG
         cout << s << " final Rank: " << rankReverse + s << endl;
 #endif
@@ -347,10 +276,11 @@ int main(int argc, const char * argv[]) {
     t1 = std::chrono::high_resolution_clock::now();
     unsigned long long maxLCP=0;
     for(unsigned long long h=0;h<lcp.size();h++) if (lcp[h]>maxLCP) maxLCP = lcp[h];
-    MAXCACHEITEMS = maxLCP;
+    MAXCACHESIZE = seqSize/12;
+    if (maxLCP<MAXCACHESIZE) cacheSize = maxLCP; else cacheSize=MAXCACHESIZE;
     t2 = std::chrono::high_resolution_clock::now();
     cout << "Finding maximum LCP value (= " << maxLCP << ") time in seconds:\t"<<  std::chrono::duration_cast<std::chrono::seconds>( t2 - t1 ).count() << endl;
-    cout << "Cache memory in MB " << numberofthreads * (maxLCP * 24)/(1024*1024) << endl;
+    cout << "Cache memory in MB " << numberofthreads * (cacheSize * 24)/(1024*1024) << endl;
     //------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
     
@@ -379,7 +309,7 @@ int main(int argc, const char * argv[]) {
     }
     for(unsigned int t=0; t<numberofthreads;t++){//wait threads to finish their duties
         pthread_join(threads[t], (void**)(&out[t]));
-        cout << "RETURNED: " << out[t]->begin << ' ' << out[t]->end << ' ' << out[t]->visitedSymbolCount << ' ' << out[t]->scannedSymbolCount << endl;
+        cout << "RETURNED: " << out[t]->begin << ' ' << out[t]->end << ' ' << (double)out[t]->visitedSymbolCount / (double)blockLength << ' ' << (double)out[t]->scannedSymbolCount / (double)blockLength << endl;
     }
     finalBWT[1] = buffer[seqSize-2]; // the symbol jsut preceding the inter sequence marker #, i.e. the last symbol of F in F#R$, notice that we assume  $<#<A<C<E(N)<G<T
     t2 = std::chrono::high_resolution_clock::now();
